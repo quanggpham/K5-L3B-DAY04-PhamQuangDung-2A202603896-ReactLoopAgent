@@ -1,19 +1,34 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+from pathlib import Path
 import urllib.error
 import urllib.request
+import uuid
 
 CONFIG = {
     'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
     'gemini': ('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'),
     'openrouter': ('OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
+    'opencode': ('OPENCODE_GO_API_KEY', 'https://opencode.ai/inference/go/openai/v1/chat/completions'),
 }
 
 
+def load_env(path=None):
+    """Nạp KEY=VALUE từ .env (nếu có) vào os.environ; không ghi đè biến đã đặt trong shell."""
+    path = Path(path) if path else Path(__file__).resolve().parent / '.env'
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.removeprefix('export ').split('=', 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"\''))
+
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', 'User-Agent': 'StatusAgentLab/1.0', **headers})
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             return json.load(response)
@@ -36,6 +51,7 @@ class Provider:
         if not model:
             raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
+        self.session_id = str(uuid.uuid4())  # one session per conversation (OpenCode)
         key_name, self.url = CONFIG[name]
         self.key = os.getenv(key_name)
         if not self.key:
@@ -47,7 +63,13 @@ class Provider:
         payload = {'model': self.model, 'messages': messages}
         if schemas:
             payload['tools'] = schemas
-        data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
+        # Một số model (vd. gpt-6-luna) chỉ cho dùng tools trên Chat Completions khi reasoning_effort='none'.
+        if os.getenv('REASONING_EFFORT'):
+            payload['reasoning_effort'] = os.environ['REASONING_EFFORT']
+        headers = {'Authorization': f'Bearer {self.key}'}
+        if self.name == 'opencode':
+            headers['x-opencode-session'] = self.session_id
+        data = post_json(self.url, headers, payload)
         choice = data['choices'][0]
         message = choice['message']
         calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in message.get('tool_calls', [])]
